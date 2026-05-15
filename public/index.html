@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>BrigadePlanner</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <main class="app-shell">
+        <section class="topbar">
+            <div>
+                <p class="eyebrow">BrigadePlanner</p>
+                <h1 id="userName">План работ</h1>
+            </div>
+            <span id="syncState" class="sync-state">offline</span>
+        </section>
+
+        <section id="loginPane" class="login-pane">
+            <label>
+                <span>Логин</span>
+                <input id="username" autocomplete="username">
+            </label>
+            <label>
+                <span>Пароль</span>
+                <input id="password" type="password" autocomplete="current-password">
+            </label>
+            <button id="loginButton" class="primary-button">Войти</button>
+            <p id="loginError" class="error-text"></p>
+        </section>
+
+        <section id="workspace" class="workspace" hidden>
+            <div class="metrics">
+                <div>
+                    <strong id="todayTotal">0</strong>
+                    <span>Всего</span>
+                </div>
+                <div>
+                    <strong id="todayInProgress">0</strong>
+                    <span>В работе</span>
+                </div>
+                <div>
+                    <strong id="todayOverdue">0</strong>
+                    <span>Просрочено</span>
+                </div>
+            </div>
+
+            <section class="task-section">
+                <div class="section-line">
+                    <h2>Сегодня</h2>
+                    <button id="refreshButton" class="ghost-button">Обновить</button>
+                </div>
+                <div id="taskList" class="task-list"></div>
+            </section>
+        </section>
+    </main>
+
+    <script src="script.js"></script>
+</body>
+</html>
