@@ -15,6 +15,22 @@ API_PROXY_TARGET=http://127.0.0.1:5156
 https://bdzahitadiploma.bothost.tech/api
 ```
 
+Before the first launch, initialize the server database:
+
+1. Run `sql/01-init-server-db.sql` on SQL Server. It creates the `BrigadePlanner`
+   database, all required tables, sample data, and starter users.
+2. Run `sql/02-security-hardening.sql` after replacing placeholder passwords.
+   This adds password-hash columns, Telegram binding columns, DB encryption setup,
+   and the restricted `brigadeplanner_api` SQL login for the API.
+
+Starter application users from `sql/01-init-server-db.sql`:
+
+```text
+1 / 1 - Администратор
+2 / 2 - Диспетчер
+3 / 3 - Бригадир
+```
+
 The database connection string, JWT key, and Telegram bot token must be configured on the ASP.NET API side:
 
 ```text
@@ -23,4 +39,5 @@ Jwt__SigningKey=<64+ random chars>
 Telegram__BotToken=<BotFather token>
 ```
 
-Run `backend/BrigadePlanner.Api/sql/security-hardening.sql` on SQL Server before production launch.
+After creating `brigadeplanner_api`, the production connection string should use
+that login instead of Windows trusted connection.
