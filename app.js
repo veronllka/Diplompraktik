@@ -7,7 +7,7 @@ const sql = require('mssql');
 
 const PORT = process.env.PORT || 3000;
 const API_PROXY_TARGET = (process.env.API_PROXY_TARGET || process.env.BRIGADE_API_BASE_URL || '').replace(/\/+$/, '');
-const DB_CONNECTION_STRING = process.env.DB_CONNECTION_STRING || process.env.ConnectionStrings__BrigadePlanner || '';
+const DB_CONNECTION_STRING = buildDbConnectionString();
 const DB_AUTO_INIT = parseBoolean(process.env.DB_AUTO_INIT, Boolean(DB_CONNECTION_STRING));
 const DB_INIT_REQUIRED = parseBoolean(process.env.DB_INIT_REQUIRED, true);
 const DB_INIT_SCRIPT = process.env.DB_INIT_SCRIPT || path.join(__dirname, 'sql', '01-init-server-db.sql');
@@ -207,4 +207,39 @@ function parseBoolean(value, fallback) {
   }
 
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function buildDbConnectionString() {
+  const explicit = process.env.DB_CONNECTION_STRING || process.env.ConnectionStrings__BrigadePlanner || '';
+  if (explicit) {
+    return explicit;
+  }
+
+  const password = process.env.DB_PASSWORD || process.env.SQL_PASSWORD || '';
+  if (!password) {
+    return '';
+  }
+
+  const host = process.env.DB_HOST || process.env.SQL_HOST || 'localhost';
+  const port = process.env.DB_PORT || process.env.SQL_PORT || '';
+  const database = process.env.DB_NAME || process.env.SQL_DATABASE || 'BrigadePlanner';
+  const user = process.env.DB_USER || process.env.SQL_USER || 'brigadeplanner_api';
+  const encrypt = parseBoolean(process.env.DB_ENCRYPT, true) ? 'True' : 'False';
+  const trustCertificate = parseBoolean(
+    process.env.DB_TRUST_SERVER_CERTIFICATE || process.env.DB_TRUST_CERTIFICATE,
+    true
+  ) ? 'True' : 'False';
+  const server = port && !host.includes(',') && !host.includes('\\')
+    ? `${host},${port}`
+    : host;
+
+  return [
+    `Server=${server}`,
+    `Database=${database}`,
+    `User ID=${user}`,
+    `Password=${password}`,
+    `Encrypt=${encrypt}`,
+    `TrustServerCertificate=${trustCertificate}`,
+    'MultipleActiveResultSets=True'
+  ].join(';') + ';';
 }

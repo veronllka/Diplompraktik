@@ -5,11 +5,22 @@ Deploy this folder (`bothost-miniapp`) as the BotHost repository root.
 Required BotHost environment variables:
 
 ```text
-PORT=3000
+PORT=7777
 API_PROXY_TARGET=http://127.0.0.1:5156
-DB_CONNECTION_STRING=<private SQL Server connection string>
 DB_AUTO_INIT=true
+DB_PASSWORD=<SQL user password>
 ```
+
+These database values are automatic by default:
+
+```text
+DB_HOST=localhost
+DB_PORT=1433
+DB_NAME=BrigadePlanner
+DB_USER=brigadeplanner_api
+```
+
+Set them only if your SQL Server uses different values.
 
 `API_PROXY_TARGET` must point to the private ASP.NET API. Public clients use only:
 
@@ -20,7 +31,7 @@ https://bdzahitadiploma.bothost.tech/api
 Before the first launch, create an empty SQL Server database named
 `BrigadePlanner` and give the API login rights to create tables in it. The Mini
 App server will initialize it automatically on startup when
-`DB_CONNECTION_STRING` is configured:
+`DB_PASSWORD` is configured:
 
 1. If the database has no user tables, it runs `sql/01-init-server-db.sql`.
 2. It always runs `sql/03-ensure-runtime-schema.sql` after that. This guarantees
@@ -51,5 +62,6 @@ Jwt__SigningKey=<64+ random chars>
 Telegram__BotToken=<BotFather token>
 ```
 
-After creating `brigadeplanner_api`, the production connection string should use
-that login instead of Windows trusted connection.
+`DB_CONNECTION_STRING` is still supported as an optional advanced override, but
+the Mini App can work without it by using `DB_HOST`, `DB_NAME`, `DB_USER`, and
+`DB_PASSWORD`.
