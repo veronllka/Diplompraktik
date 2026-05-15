@@ -7,7 +7,5 @@
     "start": "node app.js",
     "dev": "node app.js"
   },
-  "dependencies": {
-    "mssql": "^11.0.1"
-  }
+  "dependencies": {}
 }
