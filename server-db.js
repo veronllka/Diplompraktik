@@ -299,10 +299,27 @@ function handleCrews(res, method, route, body) {
   }
 
   if (method === 'POST' && route.length === 1) {
+    const externalId = normalizeExternalId(body.externalId);
+    const existing = externalId
+      ? db.crews.find(item => same(item.externalId, externalId))
+      : db.crews.find(item =>
+          same(item.crewName, body.crewName) &&
+          Number(item.brigadierId || 0) === Number(body.brigadierId || 0));
+
+    if (existing) {
+      existing.crewName = body.crewName || existing.crewName;
+      existing.brigadierId = body.brigadierId ? Number(body.brigadierId) : null;
+      if (externalId) existing.externalId = externalId;
+      existing.isActive = true;
+      saveDatabase();
+      return json(res, 200, { crewId: existing.crewId });
+    }
+
     const crew = {
       crewId: nextId('crews', 'crewId'),
       crewName: body.crewName || '',
       brigadierId: body.brigadierId ? Number(body.brigadierId) : null,
+      externalId,
       isActive: true
     };
     db.crews.push(crew);
@@ -362,6 +379,8 @@ function handleCrews(res, method, route, body) {
   if (method === 'PUT' && route.length === 2) {
     crew.crewName = body.crewName || crew.crewName;
     crew.brigadierId = body.brigadierId ? Number(body.brigadierId) : null;
+    const externalId = normalizeExternalId(body.externalId);
+    if (externalId) crew.externalId = externalId;
     saveDatabase();
     return noContent(res);
   }
@@ -381,20 +400,34 @@ function handleTasks(res, method, route, body, query, user) {
   }
 
   if (method === 'POST' && route.length === 1) {
+    const externalId = normalizeExternalId(body.externalId);
+    const existing = externalId
+      ? db.tasks.find(item => same(item.externalId, externalId))
+      : null;
+
+    if (existing) {
+      applyTaskBody(existing, body);
+      if (externalId) existing.externalId = externalId;
+      saveDatabase();
+      return json(res, 200, { taskId: existing.taskId });
+    }
+
     const task = {
       taskId: nextId('tasks', 'taskId'),
-      siteId: Number(body.siteId),
-      crewId: body.crewId ? Number(body.crewId) : null,
-      title: body.title || '',
-      description: body.description || null,
-      startDate: normalizeDate(body.startDate || today()),
-      endDate: normalizeDate(body.endDate || today()),
-      priorityId: Number(body.priorityId || 2),
-      taskStatusId: Number(body.taskStatusId || body.statusId || 1),
-      labelId: body.labelId || null,
+      siteId: 0,
+      crewId: null,
+      title: '',
+      description: null,
+      startDate: today(),
+      endDate: today(),
+      priorityId: 2,
+      taskStatusId: 1,
+      labelId: null,
+      externalId,
       publicCode: null,
       lastPrintedAt: null
     };
+    applyTaskBody(task, body);
     task.publicCode = `T-${String(task.taskId).padStart(5, '0')}`;
     db.tasks.push(task);
     saveDatabase();
@@ -410,14 +443,9 @@ function handleTasks(res, method, route, body, query, user) {
   }
 
   if (method === 'PUT' && route.length === 2) {
-    task.siteId = Number(body.siteId || task.siteId);
-    task.crewId = body.crewId ? Number(body.crewId) : null;
-    task.title = body.title || task.title;
-    task.description = body.description || null;
-    task.startDate = normalizeDate(body.startDate || task.startDate);
-    task.endDate = normalizeDate(body.endDate || task.endDate);
-    task.priorityId = Number(body.priorityId || task.priorityId);
-    task.taskStatusId = Number(body.taskStatusId || body.statusId || task.taskStatusId);
+    applyTaskBody(task, body);
+    const externalId = normalizeExternalId(body.externalId);
+    if (externalId) task.externalId = externalId;
     saveDatabase();
     return noContent(res);
   }
@@ -484,29 +512,31 @@ function handleBrigadier(res, method, route, body, query, user) {
   }
 
   if (method === 'GET' && route[1] === 'tasks' && route[2] === 'by-qr') {
-    const task = db.tasks.find(item => same(item.publicCode, route[3]));
+    const task = brigadierTaskByPublicCode(user, route[3]);
     return task ? json(res, 200, taskDto(task)) : json(res, 404, { error: 'Task not found' });
   }
 
   if (method === 'GET' && route[1] === 'tasks' && route.length === 3) {
-    const task = db.tasks.find(item => item.taskId === Number(route[2]));
+    const task = brigadierTaskById(user, Number(route[2]));
     return task ? json(res, 200, taskDto(task)) : json(res, 404, { error: 'Task not found' });
   }
 
   if (method === 'POST' && route[1] === 'tasks' && route[3] === 'status') {
-    const task = db.tasks.find(item => item.taskId === Number(route[2]));
+    const task = brigadierTaskById(user, Number(route[2]));
     if (!task) return json(res, 404, { error: 'Task not found' });
     changeTaskStatus(task, Number(body.statusId || body.taskStatusId || task.taskStatusId), body.comment, user);
     return noContent(res);
   }
 
   if (method === 'POST' && route[1] === 'tasks' && route[3] === 'comment') {
-    addTaskReport(Number(route[2]), user.userId, body.comment || '', null, null);
+    const task = brigadierTaskById(user, Number(route[2]));
+    if (!task) return json(res, 404, { error: 'Task not found' });
+    addTaskReport(task.taskId, user.userId, body.comment || '', null, null);
     return noContent(res);
   }
 
   if (method === 'POST' && route[1] === 'tasks' && route[3] === 'postpone') {
-    const task = db.tasks.find(item => item.taskId === Number(route[2]));
+    const task = brigadierTaskById(user, Number(route[2]));
     if (!task) return json(res, 404, { error: 'Task not found' });
     const oldEndDate = task.endDate;
     task.endDate = normalizeDate(body.newEndDate || task.endDate);
@@ -516,7 +546,7 @@ function handleBrigadier(res, method, route, body, query, user) {
   }
 
   if (method === 'GET' && route[1] === 'tasks' && route[3] === 'qr') {
-    const task = db.tasks.find(item => item.taskId === Number(route[2]));
+    const task = brigadierTaskById(user, Number(route[2]));
     return task ? json(res, 200, { taskId: task.taskId, qrData: task.publicCode || `T-${task.taskId}` }) : json(res, 404, { error: 'Task not found' });
   }
 
@@ -686,9 +716,41 @@ function filteredTasks(query) {
 
 function brigadierTasks(user, date) {
   const normalized = normalizeDate(date);
-  const crewIds = db.crews.filter(c => c.brigadierId === user.userId || db.crewMembers.some(m => m.crewId === c.crewId && m.userId === user.userId && !m.leftAt)).map(c => c.crewId);
-  const source = crewIds.length > 0 ? db.tasks.filter(t => crewIds.includes(t.crewId)) : db.tasks;
+  const crewIds = brigadierCrewIds(user);
+  if (crewIds.length === 0) {
+    return [];
+  }
+
+  const source = db.tasks.filter(t => crewIds.includes(t.crewId));
   return source.filter(task => task.startDate <= normalized && task.endDate >= normalized);
+}
+
+function brigadierTaskById(user, taskId) {
+  const crewIds = brigadierCrewIds(user);
+  return db.tasks.find(task => task.taskId === taskId && crewIds.includes(task.crewId));
+}
+
+function brigadierTaskByPublicCode(user, publicCode) {
+  const crewIds = brigadierCrewIds(user);
+  return db.tasks.find(task => same(task.publicCode, publicCode) && crewIds.includes(task.crewId));
+}
+
+function brigadierCrewIds(user) {
+  return db.crews
+    .filter(c => c.brigadierId === user.userId || db.crewMembers.some(m => m.crewId === c.crewId && m.userId === user.userId && !m.leftAt))
+    .map(c => c.crewId);
+}
+
+function applyTaskBody(task, body) {
+  task.siteId = Number(body.siteId || task.siteId);
+  task.crewId = body.crewId ? Number(body.crewId) : null;
+  task.title = body.title || task.title;
+  task.description = body.description || null;
+  task.startDate = normalizeDate(body.startDate || task.startDate || today());
+  task.endDate = normalizeDate(body.endDate || task.endDate || today());
+  task.priorityId = Number(body.priorityId || task.priorityId || 2);
+  task.taskStatusId = Number(body.taskStatusId || body.statusId || task.taskStatusId || 1);
+  task.labelId = body.labelId || task.labelId || null;
 }
 
 function brigadierDashboard(user, date) {
@@ -825,7 +887,8 @@ function taskDto(task) {
     brigadierId: crew?.brigadierId || null,
     brigadierName: brigadier?.fullName || null,
     priorityName: priority?.priorityName || null,
-    taskStatusName: status?.taskStatusName || null
+    taskStatusName: status?.taskStatusName || null,
+    externalId: task.externalId || null
   };
 }
 
@@ -857,8 +920,14 @@ function crewDto(crew) {
     crewId: crew.crewId,
     crewName: crew.crewName,
     brigadierId: crew.brigadierId,
-    brigadierName: brigadier?.fullName || null
+    brigadierName: brigadier?.fullName || null,
+    externalId: crew.externalId || null
   };
+}
+
+function normalizeExternalId(value) {
+  const text = String(value || '').trim();
+  return text || null;
 }
 
 function crewMemberDto(member) {
