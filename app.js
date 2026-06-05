@@ -19,6 +19,12 @@ const mimeTypes = {
 };
 
 const server = http.createServer((req, res) => {
+  if ((req.url || '').split('?')[0] === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   if ((req.url || '').startsWith('/api/')) {
     handleApi(req, res);
     return;

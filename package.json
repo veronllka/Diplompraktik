@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Telegram Mini App for BrigadePlanner on BotHost",
   "main": "app.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node app.js",
     "dev": "node app.js"

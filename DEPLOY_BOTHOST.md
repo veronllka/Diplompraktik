@@ -2,6 +2,18 @@
 
 Deploy this folder (`bothost-miniapp`) as the BotHost repository root.
 
+BotHost project settings:
+
+```text
+Library/language: Node.js
+Startup file: app.js
+Branch: main
+```
+
+If the runtime log shows `SyntaxError: invalid syntax` on `const http = require('http')`,
+the project is running as Python. Switch the BotHost library/language to Node.js
+and redeploy the same `main` branch.
+
 Required BotHost environment variables:
 
 ```text
