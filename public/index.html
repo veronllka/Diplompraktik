@@ -53,6 +53,22 @@
                 </div>
                 <div id="taskList" class="task-list"></div>
             </section>
+
+            <section id="adminPanel" class="admin-panel" hidden>
+                <div class="section-line">
+                    <h2>Админ-панель</h2>
+                    <span id="apiSpeed" class="speed-pill">API -</span>
+                </div>
+                <div class="admin-actions">
+                    <button id="checkApiButton" class="ghost-button">Проверить API</button>
+                    <button id="exportDbButton" class="ghost-button">Экспорт БД</button>
+                    <label class="file-button">
+                        Импорт БД
+                        <input id="importDbInput" type="file" accept="application/json,.json">
+                    </label>
+                </div>
+                <p id="adminStatus" class="admin-status"></p>
+            </section>
         </section>
     </main>
 

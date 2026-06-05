@@ -11,6 +11,9 @@ const loginError = document.getElementById('loginError');
 const syncState = document.getElementById('syncState');
 const userName = document.getElementById('userName');
 const taskList = document.getElementById('taskList');
+const adminPanel = document.getElementById('adminPanel');
+const adminStatus = document.getElementById('adminStatus');
+const apiSpeed = document.getElementById('apiSpeed');
 
 if (tg) {
   tg.ready();
@@ -19,6 +22,9 @@ if (tg) {
 
 document.getElementById('loginButton').addEventListener('click', loginWithPassword);
 document.getElementById('refreshButton').addEventListener('click', loadWorkspace);
+document.getElementById('checkApiButton').addEventListener('click', checkApiHealth);
+document.getElementById('exportDbButton').addEventListener('click', exportDatabase);
+document.getElementById('importDbInput').addEventListener('change', importDatabase);
 
 boot();
 
@@ -81,6 +87,7 @@ async function loadWorkspace() {
   document.getElementById('todayInProgress').textContent = dashboard.todayInProgress;
   document.getElementById('todayOverdue').textContent = dashboard.todayOverdue;
   renderTasks(tasks);
+  adminPanel.hidden = !isAdmin(me);
   showWorkspace();
   setSync('online');
 }
@@ -135,6 +142,58 @@ function openTask(task) {
   }
 }
 
+async function checkApiHealth() {
+  adminStatus.textContent = 'Проверка API...';
+  try {
+    const started = performance.now();
+    const health = await get('/api/admin/health');
+    const total = Math.round(performance.now() - started);
+    apiSpeed.textContent = `API ${Math.round(health.apiElapsedMs || total)} мс`;
+    adminStatus.textContent = `БД ${Math.round(health.databaseElapsedMs || 0)} мс · строк ${health.totalRows || 0}`;
+  } catch (error) {
+    adminStatus.textContent = 'Не удалось проверить API';
+  }
+}
+
+async function exportDatabase() {
+  adminStatus.textContent = 'Экспорт базы...';
+  try {
+    const snapshot = await get('/api/admin/export');
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `brigadeplanner-export-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    adminStatus.textContent = 'Экспорт готов';
+  } catch (error) {
+    adminStatus.textContent = 'Не удалось экспортировать БД';
+  }
+}
+
+async function importDatabase(event) {
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+
+  if (!confirm('Импорт заменит данные на сервере. Продолжить?')) {
+    return;
+  }
+
+  adminStatus.textContent = 'Импорт базы...';
+  try {
+    const text = await file.text();
+    await postRaw('/api/admin/import', text);
+    adminStatus.textContent = 'Импорт завершен';
+    await loadWorkspace();
+  } catch (error) {
+    adminStatus.textContent = 'Не удалось импортировать БД';
+  }
+}
+
 async function get(url) {
   const response = await fetch(url, {
     headers: authHeaders()
@@ -150,6 +209,18 @@ async function post(url, body, useAuth = true) {
       ...(useAuth ? authHeaders() : {})
     },
     body: JSON.stringify(body)
+  });
+  return readJson(response);
+}
+
+async function postRaw(url, rawJson) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders()
+    },
+    body: rawJson
   });
   return readJson(response);
 }
@@ -174,6 +245,12 @@ function showLogin() {
 function showWorkspace() {
   loginPane.hidden = true;
   workspace.hidden = false;
+}
+
+function isAdmin(user) {
+  const role = String(user && user.role ? user.role : '').trim().toLowerCase();
+  const username = String(user && user.username ? user.username : '').trim().toLowerCase();
+  return username === 'maksim' || ['администратор', 'админ', 'admin', 'administrator'].includes(role);
 }
 
 function setSync(value) {

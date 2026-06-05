@@ -1,12 +1,21 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { performance } = require('perf_hooks');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'brigadeplanner-db.json');
 const TOKEN_SECRET = process.env.JWT_SECRET || process.env.TOKEN_SECRET || 'brigadeplanner-miniapp-local-secret';
 const TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
-const PASSWORD_ITERATIONS = 120000;
+const ATTACHMENTS_DIR = process.env.ATTACHMENTS_DIR || path.join(DATA_DIR, 'attachments');
+const configuredMaxRequestBodyBytes = Number(process.env.MAX_REQUEST_BODY_BYTES || 15_000_000);
+const MAX_REQUEST_BODY_BYTES = Number.isFinite(configuredMaxRequestBodyBytes)
+  ? Math.max(1_000_000, configuredMaxRequestBodyBytes)
+  : 15_000_000;
+const configuredPasswordIterations = Number(process.env.PASSWORD_ITERATIONS || 60000);
+const PASSWORD_ITERATIONS = Number.isFinite(configuredPasswordIterations)
+  ? Math.max(20000, configuredPasswordIterations)
+  : 60000;
 
 const permissions = {
   dashboardView: 'dashboard.view',
@@ -28,7 +37,11 @@ const permissions = {
 
 const allPermissions = Object.values(permissions);
 
+let isDatabaseInitialized = false;
+let indexes;
 let db = loadDatabase();
+indexes = buildIndexes(db);
+isDatabaseInitialized = true;
 
 async function handleApi(req, res) {
   try {
@@ -40,6 +53,10 @@ async function handleApi(req, res) {
 
     if (method === 'GET' && pathname === '/api/health') {
       return json(res, 200, { ok: true, database: DB_FILE });
+    }
+
+    if (method === 'GET' && pathname.startsWith('/api/attachments/')) {
+      return serveAttachment(res, routeParts(pathname)[1]);
     }
 
     if (method === 'POST' && pathname === '/api/auth/login') {
@@ -64,6 +81,10 @@ async function handleApi(req, res) {
       return json(res, 200, defaultPermissions(user.role));
     }
 
+    if (method === 'POST' && pathname === '/api/attachments') {
+      return uploadAttachment(res, body || {});
+    }
+
     if (route[0] === 'users') {
       return handleUsers(res, method, route, body, user);
     }
@@ -84,8 +105,8 @@ async function handleApi(req, res) {
       return handleTasks(res, method, route, body, requestUrl.searchParams, user);
     }
 
-    if (method === 'GET' && pathname === '/api/task-reports') {
-      return json(res, 200, db.taskReports.map(taskReportDto));
+    if (route[0] === 'task-reports') {
+      return handleTaskReports(res, method, route, user);
     }
 
     if (method === 'GET' && pathname === '/api/task-statuses') {
@@ -100,6 +121,10 @@ async function handleApi(req, res) {
       return json(res, 200, dashboardDto());
     }
 
+    if (route[0] === 'admin') {
+      return handleAdmin(res, method, route, body, user);
+    }
+
     if (route[0] === 'reports') {
       return handleReports(res, method, route);
     }
@@ -109,7 +134,7 @@ async function handleApi(req, res) {
     }
 
     if (route[0] === 'materials') {
-      return handleMaterials(res, method, route);
+      return handleMaterials(res, method, route, requestUrl.searchParams, body);
     }
 
     if (route[0] === 'material-requests') {
@@ -127,12 +152,12 @@ async function handleApi(req, res) {
   }
 }
 
-function login(res, body) {
+async function login(res, body) {
   const username = String(body.username || '').trim();
   const password = String(body.password || '');
   const user = db.users.find(item => item.isActive !== false && item.username === username);
 
-  if (!user || !verifyPassword(password, user)) {
+  if (!user || !(await verifyPassword(password, user))) {
     return json(res, 401, { error: 'Invalid username or password' });
   }
 
@@ -144,9 +169,9 @@ function telegramLogin(res) {
   return json(res, 200, { token: createToken(user), user: userDto(user) });
 }
 
-function handleUsers(res, method, route, body, currentUser) {
+async function handleUsers(res, method, route, body, currentUser) {
   if (method === 'POST' && route[1] === 'change-password') {
-    if (!verifyPassword(String(body.oldPassword || ''), currentUser)) {
+    if (!(await verifyPassword(String(body.oldPassword || ''), currentUser))) {
       return json(res, 400, { error: 'Неверный текущий пароль' });
     }
 
@@ -255,9 +280,65 @@ function handleRoles(res, method, route, body) {
   return json(res, 404, { error: 'Roles endpoint not found' });
 }
 
+function handleAdmin(res, method, route, body, user) {
+  if (!isAdminUser(user)) {
+    return json(res, 403, { error: 'Forbidden' });
+  }
+
+  if (method === 'GET' && route[1] === 'health') {
+    const apiStarted = performance.now();
+    const dbStarted = performance.now();
+    let databaseElapsedMs = 0;
+    try {
+      fs.statSync(DB_FILE);
+      databaseElapsedMs = performance.now() - dbStarted;
+    } catch {
+      databaseElapsedMs = performance.now() - dbStarted;
+    }
+
+    return json(res, 200, {
+      ok: true,
+      checkedAt: isoNow(),
+      apiElapsedMs: roundMs(performance.now() - apiStarted),
+      databaseElapsedMs: roundMs(databaseElapsedMs),
+      tableCount: Object.keys(db).filter(key => Array.isArray(db[key])).length,
+      totalRows: Object.keys(db).reduce((sum, key) => sum + (Array.isArray(db[key]) ? db[key].length : 0), 0)
+    });
+  }
+
+  if (method === 'GET' && route[1] === 'export') {
+    return json(res, 200, {
+      version: 1,
+      exportedAt: isoNow(),
+      source: 'BrigadePlanner.MiniappJson',
+      tables: db
+    });
+  }
+
+  if (method === 'POST' && route[1] === 'import') {
+    const importedTables = body && body.tables && typeof body.tables === 'object'
+      ? body.tables
+      : body;
+
+    if (!importedTables || typeof importedTables !== 'object') {
+      return json(res, 400, { error: 'Import JSON must contain database tables.' });
+    }
+
+    db = ensureDatabase({ ...importedTables });
+    saveDatabase();
+    return json(res, 200, {
+      importedAt: isoNow(),
+      tableCount: Object.keys(db).filter(key => Array.isArray(db[key])).length,
+      rowCount: Object.keys(db).reduce((sum, key) => sum + (Array.isArray(db[key]) ? db[key].length : 0), 0)
+    });
+  }
+
+  return json(res, 404, { error: 'Admin endpoint not found' });
+}
+
 function handleSites(res, method, route, body) {
   if (method === 'GET' && route.length === 1) {
-    return json(res, 200, db.sites.map(siteDto));
+    return json(res, 200, db.sites.filter(site => site.isActive !== false).map(siteDto));
   }
 
   if (method === 'POST' && route.length === 1) {
@@ -498,6 +579,34 @@ function handleTasks(res, method, route, body, query, user) {
   return json(res, 404, { error: 'Tasks endpoint not found' });
 }
 
+function handleTaskReports(res, method, route, user) {
+  if (method === 'GET' && route.length === 1) {
+    return json(res, 200, db.taskReports.map(taskReportDto));
+  }
+
+  if (method === 'DELETE' && route.length === 2) {
+    if (!isAdminUser(user)) {
+      return json(res, 403, { error: 'Forbidden' });
+    }
+
+    const reportId = Number(route[1]);
+    if (!Number.isInteger(reportId) || reportId <= 0) {
+      return json(res, 400, { error: 'Invalid task report id' });
+    }
+
+    const index = db.taskReports.findIndex(report => Number(report.reportId) === reportId);
+    if (index < 0) {
+      return json(res, 404, { error: 'Task report not found' });
+    }
+
+    db.taskReports.splice(index, 1);
+    saveDatabase();
+    return noContent(res);
+  }
+
+  return json(res, 404, { error: 'Task reports endpoint not found' });
+}
+
 function handleBrigadier(res, method, route, body, query, user) {
   if (method === 'GET' && route[1] === 'dashboard') {
     return json(res, 200, brigadierDashboard(user, query.get('date') || today()));
@@ -557,15 +666,51 @@ function handleBrigadier(res, method, route, body, query, user) {
   return json(res, 404, { error: 'Brigadier endpoint not found' });
 }
 
-function handleMaterials(res, method, route) {
+function handleMaterials(res, method, route, query, body) {
   if (method === 'GET' && route[1] === 'catalog') {
-    return json(res, 200, db.materialCatalog.map(m => ({
+    const activeOnly = String(query.get('activeOnly') || 'true').toLowerCase() !== 'false';
+    const materials = activeOnly
+      ? db.materialCatalog.filter(m => m.isActive !== false)
+      : db.materialCatalog;
+    return json(res, 200, materials.map(m => ({
       materialId: m.materialId,
       name: m.name,
       unit: m.unit,
       code: m.code,
       isActive: m.isActive !== false
     })));
+  }
+
+  if (method === 'POST' && route[1] === 'catalog') {
+    const name = String(body?.name || '').trim();
+    const unit = String(body?.unit || '').trim();
+    const code = String(body?.code || '').trim() || null;
+
+    if (!name || !unit) {
+      return json(res, 400, { error: 'Material name and unit are required' });
+    }
+
+    const existing = db.materialCatalog.find(item =>
+      same(item.name, name) &&
+      same(item.unit, unit));
+
+    if (existing) {
+      existing.code = code || existing.code || null;
+      existing.isActive = true;
+      saveDatabase();
+      return json(res, 200, { materialId: existing.materialId });
+    }
+
+    const material = {
+      materialId: nextId('materialCatalog', 'materialId'),
+      name,
+      unit,
+      code,
+      isActive: true
+    };
+    db.materialCatalog.push(material);
+    saveDatabase();
+    return json(res, 200, { materialId: material.materialId });
   }
 
   return json(res, 404, { error: 'Materials endpoint not found' });
@@ -716,29 +861,40 @@ function filteredTasks(query) {
 
 function brigadierTasks(user, date) {
   const normalized = normalizeDate(date);
-  const crewIds = brigadierCrewIds(user);
-  if (crewIds.length === 0) {
+  const crewIds = new Set(brigadierCrewIds(user));
+  if (crewIds.size === 0) {
     return [];
   }
 
-  const source = db.tasks.filter(t => crewIds.includes(t.crewId));
+  const source = db.tasks.filter(t => crewIds.has(t.crewId));
   return source.filter(task => task.startDate <= normalized && task.endDate >= normalized);
 }
 
 function brigadierTaskById(user, taskId) {
-  const crewIds = brigadierCrewIds(user);
-  return db.tasks.find(task => task.taskId === taskId && crewIds.includes(task.crewId));
+  const crewIds = new Set(brigadierCrewIds(user));
+  const task = indexes.tasksById.get(Number(taskId));
+  return task && crewIds.has(task.crewId) ? task : null;
 }
 
 function brigadierTaskByPublicCode(user, publicCode) {
-  const crewIds = brigadierCrewIds(user);
-  return db.tasks.find(task => same(task.publicCode, publicCode) && crewIds.includes(task.crewId));
+  const crewIds = new Set(brigadierCrewIds(user));
+  return db.tasks.find(task => same(task.publicCode, publicCode) && crewIds.has(task.crewId));
 }
 
 function brigadierCrewIds(user) {
-  return db.crews
-    .filter(c => c.brigadierId === user.userId || db.crewMembers.some(m => m.crewId === c.crewId && m.userId === user.userId && !m.leftAt))
-    .map(c => c.crewId);
+  const ids = new Set();
+  for (const crew of indexes.crewsByBrigadierId.get(Number(user.userId)) || []) {
+    if (crew.isActive !== false) ids.add(crew.crewId);
+  }
+
+  for (const member of indexes.crewMembersByUserId.get(Number(user.userId)) || []) {
+    if (!member.leftAt) {
+      const crew = joinCrew(member.crewId);
+      if (crew) ids.add(crew.crewId);
+    }
+  }
+
+  return Array.from(ids);
 }
 
 function applyTaskBody(task, body) {
@@ -756,8 +912,8 @@ function applyTaskBody(task, body) {
 function brigadierDashboard(user, date) {
   const normalized = normalizeDate(date);
   const tasks = brigadierTasks(user, normalized);
-  const crew = db.crews.find(c => c.brigadierId === user.userId)
-    || db.crews.find(c => db.crewMembers.some(m => m.crewId === c.crewId && m.userId === user.userId && !m.leftAt));
+  const crewIds = brigadierCrewIds(user);
+  const crew = crewIds.length > 0 ? joinCrew(crewIds[0]) : null;
   return {
     fullName: user.fullName,
     crewName: crew?.crewName || null,
@@ -774,13 +930,20 @@ function calendarDays(user, year, month) {
   const m = month || (new Date().getMonth() + 1);
   const start = new Date(Date.UTC(y, m - 1, 1));
   const end = new Date(Date.UTC(y, m, 0));
+  const startDate = start.toISOString().slice(0, 10);
+  const endDate = end.toISOString().slice(0, 10);
+  const crewIds = new Set(brigadierCrewIds(user));
+  const tasks = db.tasks.filter(task =>
+    crewIds.has(task.crewId) &&
+    task.startDate <= endDate &&
+    task.endDate >= startDate);
   const result = [];
 
   for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
     const date = d.toISOString().slice(0, 10);
-    const tasks = brigadierTasks(user, date);
-    if (tasks.length > 0) {
-      result.push({ date, taskCount: tasks.length, hasOverdue: tasks.some(isOverdue) });
+    const dayTasks = tasks.filter(task => task.startDate <= date && task.endDate >= date);
+    if (dayTasks.length > 0) {
+      result.push({ date, taskCount: dayTasks.length, hasOverdue: dayTasks.some(isOverdue) });
     }
   }
 
@@ -806,6 +969,102 @@ function addTaskReport(taskId, userId, text, progressPercent, attachmentUrl, sho
     attachmentUrl: attachmentUrl || null
   });
   if (shouldSave) saveDatabase();
+}
+
+function uploadAttachment(res, body) {
+  const originalName = sanitizeAttachmentFileName(body.fileName);
+  const contentBase64 = String(body.contentBase64 || '');
+  if (!originalName || !contentBase64) {
+    return json(res, 400, { error: 'fileName and contentBase64 are required' });
+  }
+
+  let content;
+  try {
+    content = Buffer.from(contentBase64, 'base64');
+  } catch {
+    return json(res, 400, { error: 'Invalid attachment content' });
+  }
+
+  if (!content.length) {
+    return json(res, 400, { error: 'Attachment is empty' });
+  }
+
+  fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+  const storedName = `${crypto.randomBytes(16).toString('hex')}_${originalName}`;
+  fs.writeFileSync(path.join(ATTACHMENTS_DIR, storedName), content);
+  return json(res, 200, { attachmentUrl: `/api/attachments/${encodeURIComponent(storedName)}` });
+}
+
+function serveAttachment(res, fileName) {
+  const safeName = path.basename(String(fileName || ''));
+  if (!safeName) {
+    res.writeHead(404);
+    res.end('Not found');
+    return;
+  }
+
+  const filePath = path.resolve(path.join(ATTACHMENTS_DIR, safeName));
+  const rootPath = path.resolve(ATTACHMENTS_DIR);
+  if (!filePath.startsWith(rootPath + path.sep) && filePath !== rootPath) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+
+  fs.readFile(filePath, (error, content) => {
+    if (error) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': attachmentMimeType(path.extname(filePath)),
+      'Cache-Control': 'public, max-age=31536000'
+    });
+    res.end(content);
+  });
+}
+
+function sanitizeAttachmentFileName(fileName) {
+  const rawName = path.basename(String(fileName || '').trim());
+  if (!rawName) return null;
+  return rawName
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 120);
+}
+
+function attachmentMimeType(extension) {
+  switch (String(extension || '').toLowerCase()) {
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.png':
+      return 'image/png';
+    case '.bmp':
+      return 'image/bmp';
+    case '.gif':
+      return 'image/gif';
+    case '.pdf':
+      return 'application/pdf';
+    case '.txt':
+      return 'text/plain; charset=utf-8';
+    case '.csv':
+      return 'text/csv; charset=utf-8';
+    case '.tsv':
+      return 'text/tab-separated-values; charset=utf-8';
+    case '.doc':
+      return 'application/msword';
+    case '.docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case '.xls':
+      return 'application/vnd.ms-excel';
+    case '.xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    default:
+      return 'application/octet-stream';
+  }
 }
 
 function replaceMaterialRequestItems(requestId, items) {
@@ -943,7 +1202,7 @@ function crewMemberDto(member) {
 }
 
 function taskReportDto(report) {
-  const task = db.tasks.find(item => item.taskId === report.taskId);
+  const task = indexes.tasksById.get(Number(report.taskId));
   const user = joinUser(report.reportedByUserId);
   return {
     reportId: report.reportId,
@@ -971,7 +1230,7 @@ function taskPrintDto(print) {
 }
 
 function materialRequestDto(request) {
-  const task = db.tasks.find(item => item.taskId === request.taskId);
+  const task = indexes.tasksById.get(Number(request.taskId));
   const site = task ? joinSite(task.siteId) : null;
   const crew = task ? joinCrew(task.crewId) : null;
   return {
@@ -983,14 +1242,16 @@ function materialRequestDto(request) {
     status: request.status,
     comment: request.comment,
     taskTitle: task?.title || null,
+    siteId: task?.siteId || null,
     siteName: site?.siteName || null,
+    crewId: task?.crewId || null,
     crewName: crew?.crewName || null,
-    items: db.materialRequestItems.filter(item => item.requestId === request.requestId).map(materialRequestItemDto)
+    items: (indexes.materialItemsByRequestId.get(Number(request.requestId)) || []).map(materialRequestItemDto)
   };
 }
 
 function materialRequestItemDto(item) {
-  const material = db.materialCatalog.find(m => m.materialId === item.materialId);
+  const material = indexes.materialById.get(Number(item.materialId));
   return {
     requestItemId: item.requestItemId,
     requestId: item.requestId,
@@ -1010,12 +1271,12 @@ function dailyPlanDto(plan) {
     createdAt: plan.createdAt,
     comment: plan.comment,
     status: plan.status,
-    items: db.dailyPlanItems.filter(item => item.planId === plan.planId).map(dailyPlanItemDto)
+    items: (indexes.dailyItemsByPlanId.get(Number(plan.planId)) || []).map(dailyPlanItemDto)
   };
 }
 
 function dailyPlanItemDto(item) {
-  const task = db.tasks.find(t => t.taskId === item.taskId);
+  const task = indexes.tasksById.get(Number(item.taskId));
   const crew = joinCrew(item.crewId);
   const site = task ? joinSite(task.siteId) : null;
   return {
@@ -1065,6 +1326,17 @@ function defaultPermissions(roleName) {
   return [];
 }
 
+function isAdminUser(user) {
+  if (!user) return false;
+  if (String(user.username || '').trim().toLowerCase() === 'maksim') return true;
+  const roleName = joinRole(user.roleId)?.roleName || user.role || '';
+  return ['администратор', 'админ', 'admin', 'administrator'].includes(String(roleName).trim().toLowerCase());
+}
+
+function roundMs(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
 function loadDatabase() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   let loaded = null;
@@ -1078,10 +1350,58 @@ function loadDatabase() {
 }
 
 function saveDatabase(database = db) {
+  if (isDatabaseInitialized && database === db && indexes) {
+    indexes = buildIndexes(database);
+  }
+
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const tmp = `${DB_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(database, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(database), 'utf8');
   fs.renameSync(tmp, DB_FILE);
+}
+
+function buildIndexes(database) {
+  const index = {
+    rolesById: new Map(),
+    usersById: new Map(),
+    sitesById: new Map(),
+    crewsById: new Map(),
+    crewsByBrigadierId: new Map(),
+    prioritiesById: new Map(),
+    statusesById: new Map(),
+    tasksById: new Map(),
+    materialById: new Map(),
+    crewMembersByUserId: new Map(),
+    materialItemsByRequestId: new Map(),
+    dailyItemsByPlanId: new Map()
+  };
+
+  for (const role of database.roles || []) index.rolesById.set(Number(role.roleId), role);
+  for (const user of database.users || []) index.usersById.set(Number(user.userId), user);
+  for (const site of database.sites || []) index.sitesById.set(Number(site.siteId), site);
+  for (const crew of database.crews || []) {
+    index.crewsById.set(Number(crew.crewId), crew);
+    addIndexed(index.crewsByBrigadierId, Number(crew.brigadierId), crew);
+  }
+  for (const priority of database.priorities || []) index.prioritiesById.set(Number(priority.priorityId), priority);
+  for (const status of database.taskStatuses || []) index.statusesById.set(Number(status.taskStatusId), status);
+  for (const task of database.tasks || []) index.tasksById.set(Number(task.taskId), task);
+  for (const material of database.materialCatalog || []) index.materialById.set(Number(material.materialId), material);
+  for (const member of database.crewMembers || []) addIndexed(index.crewMembersByUserId, Number(member.userId), member);
+  for (const item of database.materialRequestItems || []) addIndexed(index.materialItemsByRequestId, Number(item.requestId), item);
+  for (const item of database.dailyPlanItems || []) addIndexed(index.dailyItemsByPlanId, Number(item.planId), item);
+
+  return index;
+}
+
+function addIndexed(map, key, value) {
+  if (!Number.isFinite(key)) return;
+  const values = map.get(key);
+  if (values) {
+    values.push(value);
+  } else {
+    map.set(key, [value]);
+  }
 }
 
 function ensureDatabase(database) {
@@ -1092,20 +1412,19 @@ function ensureDatabase(database) {
     if (key === 'counters' && !database[key]) database[key] = {};
   }
 
-  ensureStarterRows(database);
+  ensureStarterRows(database, seeded);
   rebuildCounters(database);
   return database;
 }
 
 function seedDatabase() {
   const date = today();
-  const tomorrow = addDays(date, 1);
-  const nextWeek = addDays(date, 7);
-  const pastStart = addDays(date, -5);
-  const pastEnd = addDays(date, -1);
   const admin = userSeed(1, '1', '1', 'Администратор', 1);
   const dispatcher = userSeed(2, '2', '2', 'Диспетчер', 2);
-  const brigadier = userSeed(3, '3', '3', 'Бригадир', 3);
+  const brigadier = userSeed(3, '3', '3', 'Бригадир 1', 3);
+  const brigadier2 = userSeed(5, 'brigadir2', 'brigadir2', 'Бригадир 2', 3);
+  const brigadier3 = userSeed(6, 'brigadir3', 'brigadir3', 'Бригадир 3', 3);
+  const demo = buildFullDemoSeed(date);
 
   return {
     counters: {},
@@ -1115,81 +1434,420 @@ function seedDatabase() {
       { roleId: 3, roleName: 'Бригадир' }
     ],
     rolePermissions: {},
-    users: [admin, dispatcher, brigadier],
-    sites: [
-      { siteId: 1, siteCode: 'SEV-01', siteName: 'Северный квартал', address: 'г. Москва, ул. Северная, 10', isActive: true },
-      { siteId: 2, siteCode: 'ZAP-02', siteName: 'Западный мост', address: 'г. Москва, пр-т Западный, 25', isActive: true }
-    ],
-    crews: [
-      { crewId: 1, crewName: 'Бригада 1', brigadierId: 3, isActive: true }
-    ],
-    crewMembers: [
-      { crewId: 1, userId: 3, joinedAt: date, leftAt: null }
-    ],
-    priorities: [
-      { priorityId: 1, priorityName: 'Низкий', sortOrder: 1 },
-      { priorityId: 2, priorityName: 'Средний', sortOrder: 2 },
-      { priorityId: 3, priorityName: 'Высокий', sortOrder: 3 },
-      { priorityId: 4, priorityName: 'Критичный', sortOrder: 4 }
-    ],
-    taskStatuses: [
-      { taskStatusId: 1, taskStatusName: 'Новая' },
-      { taskStatusId: 2, taskStatusName: 'В работе' },
-      { taskStatusId: 3, taskStatusName: 'Завершено' },
-      { taskStatusId: 4, taskStatusName: 'Просрочено' }
-    ],
-    tasks: [
-      { taskId: 1, siteId: 1, crewId: 1, title: 'Проверка объекта', description: 'Первичный осмотр участка', startDate: date, endDate: tomorrow, priorityId: 2, taskStatusId: 2, labelId: null, publicCode: 'T-00001', lastPrintedAt: null },
-      { taskId: 2, siteId: 1, crewId: 1, title: 'Заливка фундамента', description: 'Монолитные работы, карта N3', startDate: date, endDate: nextWeek, priorityId: 4, taskStatusId: 1, labelId: null, publicCode: 'T-00002', lastPrintedAt: null },
-      { taskId: 3, siteId: 2, crewId: 1, title: 'Подготовка материалов', description: 'Проверить поставку арматуры', startDate: date, endDate: tomorrow, priorityId: 3, taskStatusId: 1, labelId: null, publicCode: 'T-00003', lastPrintedAt: null },
-      { taskId: 4, siteId: 2, crewId: 1, title: 'Закрыть старый наряд', description: 'Проверить просроченный наряд', startDate: pastStart, endDate: pastEnd, priorityId: 2, taskStatusId: 2, labelId: null, publicCode: 'T-00004', lastPrintedAt: null }
-    ],
-    taskReports: [
-      { reportId: 1, taskId: 1, reportedByUserId: 3, reportedAt: isoNow(), reportText: 'Работы приняты в план.', progressPercent: 10, attachmentUrl: null }
-    ],
+    users: [admin, dispatcher, brigadier, brigadier2, brigadier3],
+    sites: demo.sites,
+    crews: demo.crews,
+    crewMembers: demo.crewMembers,
+    priorities: demo.priorities,
+    taskStatuses: demo.taskStatuses,
+    tasks: demo.tasks,
+    taskReports: demo.taskReports,
     taskPrintLogs: [],
-    materialCatalog: [
-      { materialId: 1, name: 'Бетон B25', unit: 'м3', code: 'BET-B25', isActive: true },
-      { materialId: 2, name: 'Арматура A500', unit: 'т', code: 'ARM-A500', isActive: true },
-      { materialId: 3, name: 'Опалубка', unit: 'компл.', code: 'OPL', isActive: true }
-    ],
-    materialRequests: [
-      { requestId: 1, taskId: 2, createdByUserId: 2, createdAt: isoNow(), requiredDate: tomorrow, status: 'Submitted', comment: 'Материалы для фундамента' }
-    ],
-    materialRequestItems: [
-      { requestItemId: 1, requestId: 1, materialId: 1, qty: 12, comment: null },
-      { requestItemId: 2, requestId: 1, materialId: 2, qty: 2, comment: null }
-    ],
+    materialCatalog: demo.materialCatalog,
+    materialRequests: demo.materialRequests,
+    materialRequestItems: demo.materialRequestItems,
     materialRequestStatusLog: [],
-    materialDeliveryDocs: [],
-    dailyPlans: [],
-    dailyPlanItems: []
+    materialDeliveryDocs: demo.materialDeliveryDocs,
+    dailyPlans: demo.dailyPlans,
+    dailyPlanItems: demo.dailyPlanItems
   };
 }
 
-function ensureStarterRows(database) {
-  for (const role of seedDatabase().roles) {
-    if (!database.roles.some(item => item.roleId === role.roleId)) database.roles.push(role);
-  }
+function buildFullDemoSeed(date) {
+  const sites = [
+    { siteId: 1, siteCode: 'SEV-01', siteName: 'Северный квартал', address: 'г. Москва, ул. Северная, 10', isActive: true },
+    { siteId: 2, siteCode: 'ZAP-02', siteName: 'Западный мост', address: 'г. Москва, пр-т Западный, 25', isActive: true },
+    { siteId: 3, siteCode: 'CENT-03', siteName: 'Центральный корпус', address: 'г. Москва, ул. Центральная, 7', isActive: true },
+    { siteId: 4, siteCode: 'SKL-04', siteName: 'Складской терминал', address: 'г. Химки, Транспортный проезд, 4', isActive: true }
+  ];
 
-  for (const starter of [userSeed(1, '1', '1', 'Администратор', 1), userSeed(2, '2', '2', 'Диспетчер', 2), userSeed(3, '3', '3', 'Бригадир', 3)]) {
-    const existing = database.users.find(item => item.username === starter.username);
-    if (!existing) database.users.push(starter);
-    else {
-      existing.isActive = true;
-      existing.roleId = starter.roleId;
-      existing.fullName = existing.fullName || starter.fullName;
-      if (!existing.passwordHash) setUserPassword(existing, starter.username);
+  const crews = [
+    { crewId: 1, crewName: 'Монолитная бригада', brigadierId: 3, externalId: 'seed:crew:monolith', isActive: true },
+    { crewId: 2, crewName: 'Отделочная бригада', brigadierId: 5, externalId: 'seed:crew:finish', isActive: true },
+    { crewId: 3, crewName: 'Инженерная бригада', brigadierId: 6, externalId: 'seed:crew:engineering', isActive: true }
+  ];
+
+  const crewMembers = [
+    { crewId: 1, userId: 3, joinedAt: addDays(date, -30), leftAt: null },
+    { crewId: 2, userId: 5, joinedAt: addDays(date, -24), leftAt: null },
+    { crewId: 3, userId: 6, joinedAt: addDays(date, -20), leftAt: null }
+  ];
+
+  const priorities = [
+    { priorityId: 1, priorityName: 'Низкий', sortOrder: 1 },
+    { priorityId: 2, priorityName: 'Средний', sortOrder: 2 },
+    { priorityId: 3, priorityName: 'Высокий', sortOrder: 3 },
+    { priorityId: 4, priorityName: 'Критичный', sortOrder: 4 }
+  ];
+
+  const taskStatuses = [
+    { taskStatusId: 1, taskStatusName: 'Новая' },
+    { taskStatusId: 2, taskStatusName: 'В работе' },
+    { taskStatusId: 3, taskStatusName: 'Завершено' },
+    { taskStatusId: 4, taskStatusName: 'Просрочено' }
+  ];
+
+  const materialCatalog = [
+    { materialId: 1, name: 'Бетон B25', unit: 'м3', code: 'BET-B25', isActive: true },
+    { materialId: 2, name: 'Арматура A500', unit: 'т', code: 'ARM-A500', isActive: true },
+    { materialId: 3, name: 'Опалубка', unit: 'компл.', code: 'OPL', isActive: true },
+    { materialId: 4, name: 'Кирпич керамический', unit: 'шт.', code: 'KIR-KER', isActive: true },
+    { materialId: 5, name: 'Раствор кладочный М100', unit: 'м3', code: 'RST-M100', isActive: true },
+    { materialId: 6, name: 'Грунтовка глубокого проникновения', unit: 'л', code: 'GRU-GP', isActive: true },
+    { materialId: 7, name: 'Гипсовая штукатурка', unit: 'меш.', code: 'SHT-GIP', isActive: true },
+    { materialId: 8, name: 'Плитка керамогранит', unit: 'м2', code: 'PLT-KER', isActive: true },
+    { materialId: 9, name: 'Кабель ВВГнг-LS', unit: 'м', code: 'KBL-VVG', isActive: true },
+    { materialId: 10, name: 'Труба ПНД 32', unit: 'м', code: 'TRB-PND32', isActive: true },
+    { materialId: 11, name: 'Воздуховод оцинкованный', unit: 'м', code: 'VENT-ZN', isActive: true },
+    { materialId: 12, name: 'Мембрана кровельная', unit: 'м2', code: 'MEM-KROV', isActive: true },
+    { materialId: 13, name: 'Бетон B20', unit: 'м3', code: 'BET-B20', isActive: true },
+    { materialId: 14, name: 'Бетон B30', unit: 'м3', code: 'BET-B30', isActive: true },
+    { materialId: 15, name: 'Песок строительный', unit: 'м3', code: 'SAND', isActive: true },
+    { materialId: 16, name: 'Щебень фракция 20-40', unit: 'м3', code: 'SCH-2040', isActive: true },
+    { materialId: 17, name: 'Цемент М500', unit: 'меш.', code: 'CEM-M500', isActive: true },
+    { materialId: 18, name: 'Проволока вязальная', unit: 'кг', code: 'WIRE-KNIT', isActive: true },
+    { materialId: 19, name: 'Фиксатор арматуры', unit: 'шт.', code: 'FIX-ARM', isActive: true },
+    { materialId: 20, name: 'Блок газобетонный', unit: 'шт.', code: 'GBLOCK', isActive: true },
+    { materialId: 21, name: 'Шпатлевка финишная', unit: 'меш.', code: 'SHP-FIN', isActive: true },
+    { materialId: 22, name: 'Краска водно-дисперсионная', unit: 'л', code: 'PAINT-VD', isActive: true },
+    { materialId: 23, name: 'Клей плиточный', unit: 'меш.', code: 'GLUE-PLT', isActive: true },
+    { materialId: 24, name: 'Гидроизоляционная мастика', unit: 'кг', code: 'HYD-MAST', isActive: true },
+    { materialId: 25, name: 'Утеплитель минераловатный', unit: 'м2', code: 'INS-MW', isActive: true },
+    { materialId: 26, name: 'Гипсокартон', unit: 'лист', code: 'GKL', isActive: true },
+    { materialId: 27, name: 'Профиль металлический', unit: 'м', code: 'PROF-MET', isActive: true },
+    { materialId: 28, name: 'Саморезы', unit: 'упак.', code: 'SCREW', isActive: true },
+    { materialId: 29, name: 'Дюбель-гвоздь', unit: 'упак.', code: 'DOWEL', isActive: true },
+    { materialId: 30, name: 'Гофротруба', unit: 'м', code: 'GOFRA', isActive: true },
+    { materialId: 31, name: 'Автоматический выключатель', unit: 'шт.', code: 'AUT-SW', isActive: true },
+    { materialId: 32, name: 'Розетка', unit: 'шт.', code: 'SOCKET', isActive: true },
+    { materialId: 33, name: 'Светильник', unit: 'шт.', code: 'LIGHT', isActive: true },
+    { materialId: 34, name: 'Труба ПВХ канализационная', unit: 'м', code: 'TRB-PVC', isActive: true },
+    { materialId: 35, name: 'Фитинги сантехнические', unit: 'компл.', code: 'FIT-SAN', isActive: true },
+    { materialId: 36, name: 'Клапан вентиляционный', unit: 'шт.', code: 'VENT-KL', isActive: true },
+    { materialId: 37, name: 'Дверной блок', unit: 'шт.', code: 'DOOR-BLK', isActive: true },
+    { materialId: 38, name: 'Оконный блок', unit: 'шт.', code: 'WIN-BLK', isActive: true },
+    { materialId: 39, name: 'Пена монтажная', unit: 'балл.', code: 'FOAM', isActive: true },
+    { materialId: 40, name: 'Герметик силиконовый', unit: 'туб.', code: 'SEAL-SIL', isActive: true }
+  ];
+
+  const tasks = [
+    taskSeed(date, 1, 1, 1, 'Разметка осей секции А', 'Вынести проектные оси, закрепить реперы и оформить исполнительную схему.', -1, 1, 3, 2),
+    taskSeed(date, 2, 1, 1, 'Армирование плиты перекрытия', 'Собрать нижнюю и верхнюю сетку, проверить защитный слой и выпуски.', 0, 4, 4, 2),
+    taskSeed(date, 3, 1, 1, 'Заливка бетона под колонны', 'Подготовить карту бетонирования, принять бетон B25 и выполнить виброуплотнение.', 1, 5, 4, 1),
+    taskSeed(date, 4, 1, 2, 'Монтаж опалубки лестничного марша', 'Собрать щиты, выставить подпорки, проверить геометрию перед армированием.', -2, 2, 3, 2),
+    taskSeed(date, 5, 2, 1, 'Гидроизоляция фундамента', 'Очистить поверхность, нанести праймер и два слоя рулонной гидроизоляции.', -3, -1, 3, 4),
+    taskSeed(date, 6, 3, 2, 'Кладка перегородок 2 этажа', 'Выполнить кладку межкомнатных перегородок с перевязкой и армированием рядов.', 0, 6, 3, 2),
+    taskSeed(date, 7, 3, 2, 'Штукатурка мест общего пользования', 'Подготовить основания, выставить маяки и выполнить машинное нанесение.', 2, 8, 2, 1),
+    taskSeed(date, 8, 3, 2, 'Монтаж оконных блоков', 'Проверить проемы, установить рамы, выполнить крепление и герметизацию узлов.', -4, -1, 2, 3),
+    taskSeed(date, 9, 3, 2, 'Стяжка пола секция Б', 'Подготовить основание, разложить демпферную ленту и залить стяжку.', -1, 3, 3, 2),
+    taskSeed(date, 10, 3, 2, 'Укладка плитки входной группы', 'Разметить рисунок, уложить керамогранит и выполнить затирку швов.', 4, 10, 2, 1),
+    taskSeed(date, 11, 4, 3, 'Прокладка кабельных трасс', 'Разметить трассы, смонтировать лотки и протянуть кабельные линии.', -1, 5, 3, 2),
+    taskSeed(date, 12, 4, 3, 'Монтаж щита освещения', 'Установить щит, собрать автоматы, подписать группы и выполнить прозвонку.', 1, 3, 3, 1),
+    taskSeed(date, 13, 4, 3, 'Сборка вентиляционного короба', 'Смонтировать оцинкованные секции, выполнить подвесы и проверить герметичность.', 0, 4, 2, 2),
+    taskSeed(date, 14, 4, 3, 'Пусконаладка насосной станции', 'Проверить подключение, выполнить пробный пуск и замер рабочих параметров.', 5, 7, 4, 1),
+    taskSeed(date, 15, 4, 3, 'Проверка пожарной сигнализации', 'Протестировать шлейфы, датчики и передачу сигнала на пост охраны.', -2, 0, 4, 2),
+    taskSeed(date, 16, 2, 1, 'Подготовка кровли к мембране', 'Очистить основание, проверить уклоны и подготовить примыкания.', -5, -2, 2, 4),
+    taskSeed(date, 17, 2, 1, 'Монтаж водосточной системы', 'Установить кронштейны, желоба и воронки с проверкой уклонов.', 2, 6, 2, 1),
+    taskSeed(date, 18, 1, 1, 'Приемка поставки арматуры', 'Сверить сертификаты, объемы поставки и разместить арматуру по картам.', 0, 0, 3, 2),
+    taskSeed(date, 19, 2, 2, 'Устранение замечаний технадзора', 'Закрыть замечания по отделочным работам и приложить фотофиксацию.', -6, -3, 3, 3),
+    taskSeed(date, 20, 4, 3, 'Финальная уборка зоны работ', 'Очистить рабочую зону, вывезти мусор и подготовить участок к приемке.', 6, 8, 1, 1)
+  ];
+
+  const taskReports = [
+    { reportId: 1, taskId: 1, reportedByUserId: 3, reportedAt: isoNow(), reportText: 'Разметка начата, реперы закреплены.', progressPercent: 35, attachmentUrl: null },
+    { reportId: 2, taskId: 2, reportedByUserId: 3, reportedAt: isoNow(), reportText: 'Нижняя сетка собрана, требуется довоз фиксаторов.', progressPercent: 45, attachmentUrl: null },
+    { reportId: 3, taskId: 6, reportedByUserId: 5, reportedAt: isoNow(), reportText: 'Перегородки по оси 2-4 выполнены до отметки 1.8 м.', progressPercent: 40, attachmentUrl: null },
+    { reportId: 4, taskId: 11, reportedByUserId: 6, reportedAt: isoNow(), reportText: 'Лотки смонтированы в коридоре, продолжаем протяжку кабеля.', progressPercent: 55, attachmentUrl: null },
+    { reportId: 5, taskId: 8, reportedByUserId: 5, reportedAt: isoNow(), reportText: 'Оконные блоки установлены и приняты мастером участка.', progressPercent: 100, attachmentUrl: null },
+    { reportId: 6, taskId: 19, reportedByUserId: 5, reportedAt: isoNow(), reportText: 'Замечания технадзора закрыты.', progressPercent: 100, attachmentUrl: null }
+  ];
+
+  const requestDefs = [
+    [1, 1, 'Submitted', 1, 'Демо MR-01: материалы для разметки осей', [[6, 30, 'грунт для закрепления меток'], [10, 80, 'защитные гильзы']]],
+    [2, 2, 'Approved', 2, 'Демо MR-02: арматура и фиксаторы для плиты', [[2, 4.5, 'основной каркас'], [3, 1, 'доборные щиты']]],
+    [3, 2, 'Submitted', 1, 'Демо MR-03: бетон для перекрытия', [[1, 28, 'поставка утром'], [2, 1.2, 'доборные стержни']]],
+    [4, 3, 'Draft', 3, 'Демо MR-04: комплект под бетонирование колонн', [[1, 18, null], [3, 1, null]]],
+    [5, 4, 'Issued', 1, 'Демо MR-05: опалубка для лестничного марша', [[3, 2, 'комплекты щитов'], [2, 0.8, null]]],
+    [6, 5, 'Rejected', -1, 'Демо MR-06: гидроизоляционные материалы', [[6, 40, 'праймер'], [12, 120, 'рулонная мембрана']]],
+    [7, 6, 'Submitted', 2, 'Демо MR-07: кирпич и раствор для перегородок', [[4, 3200, null], [5, 8, null]]],
+    [8, 6, 'Approved', 3, 'Демо MR-08: доборные материалы для кладки', [[4, 900, 'резерв'], [6, 20, null]]],
+    [9, 7, 'Draft', 5, 'Демо MR-09: штукатурка МОП', [[7, 160, null], [6, 50, null]]],
+    [10, 8, 'Closed', -1, 'Демо MR-10: материалы для монтажа окон', [[6, 25, 'грунт проемов'], [10, 40, 'доборные элементы']]],
+    [11, 9, 'Submitted', 1, 'Демо MR-11: материалы для стяжки', [[5, 12, 'раствор'], [6, 30, null]]],
+    [12, 10, 'Draft', 6, 'Демо MR-12: плитка входной группы', [[8, 95, 'с запасом 7%'], [6, 20, null]]],
+    [13, 11, 'Approved', 1, 'Демо MR-13: кабельные трассы', [[9, 650, 'основной кабель'], [10, 120, 'защитная труба']]],
+    [14, 11, 'Submitted', 2, 'Демо MR-14: добор по электромонтажу', [[9, 180, null], [6, 10, null]]],
+    [15, 12, 'Draft', 3, 'Демо MR-15: щит освещения', [[9, 90, 'подключение групп'], [10, 40, null]]],
+    [16, 13, 'Issued', 1, 'Демо MR-16: вентиляционный короб', [[11, 75, 'оцинкованные секции'], [10, 30, 'крепление']]],
+    [17, 14, 'Draft', 5, 'Демо MR-17: насосная станция', [[9, 120, 'питание насосов'], [10, 35, 'обвязка']]],
+    [18, 15, 'Submitted', 1, 'Демо MR-18: пожарная сигнализация', [[9, 260, 'кабель шлейфов'], [10, 60, 'гофра']]],
+    [19, 16, 'Approved', -2, 'Демо MR-19: кровельная мембрана', [[12, 450, null], [6, 80, 'праймер']]],
+    [20, 17, 'Draft', 4, 'Демо MR-20: водосточная система', [[10, 140, 'стояки и выпуски'], [12, 60, 'узлы примыкания']]],
+    [21, 18, 'Closed', 0, 'Демо MR-21: приемка арматуры', [[2, 6.5, 'поставка по накладной'], [6, 15, null]]],
+    [22, 19, 'Closed', -2, 'Демо MR-22: устранение замечаний отделки', [[7, 45, null], [8, 18, null]]],
+    [23, 20, 'Draft', 7, 'Демо MR-23: финальная уборка', [[6, 12, 'расходники'], [10, 20, null]]],
+    [24, 1, 'Submitted', 2, 'Демо MR-24: дополнительный комплект для осей', [[6, 15, null], [9, 40, 'подсветка зоны']]],
+    [25, 3, 'Approved', 4, 'Демо MR-25: резерв бетона для колонн', [[1, 10, 'резерв'], [2, 0.6, null]]],
+    [26, 4, 'Submitted', 2, 'Демо MR-26: крепеж и доборы опалубки', [[3, 1, null], [10, 25, null]]],
+    [27, 7, 'Draft', 6, 'Демо MR-27: добор штукатурки', [[7, 60, null], [6, 25, null]]],
+    [28, 9, 'Issued', 1, 'Демо MR-28: материалы для стяжки секции Б', [[5, 9, null], [6, 18, null]]],
+    [29, 13, 'Submitted', 3, 'Демо MR-29: дополнительные воздуховоды', [[11, 35, null], [10, 22, null]]],
+    [30, 15, 'Approved', 2, 'Демо MR-30: расходники ПС', [[9, 130, null], [10, 40, null]]],
+    [31, 16, 'Rejected', -1, 'Демо MR-31: повторная заявка по кровле', [[12, 210, 'требуется уточнение объема'], [6, 35, null]]],
+    [32, 17, 'Submitted', 5, 'Демо MR-32: комплект водостока', [[10, 85, null], [12, 40, null]]]
+  ];
+
+  const materialRequests = [];
+  const materialRequestItems = [];
+  let requestItemId = 1;
+  for (const [requestId, taskId, status, requiredOffset, comment, items] of requestDefs) {
+    materialRequests.push({
+      requestId,
+      taskId,
+      createdByUserId: 2,
+      createdAt: isoNow(),
+      requiredDate: addDays(date, requiredOffset),
+      status,
+      comment
+    });
+
+    for (const [materialId, qty, itemComment] of items) {
+      materialRequestItems.push({
+        requestItemId: requestItemId++,
+        requestId,
+        materialId,
+        qty,
+        comment: itemComment || null
+      });
     }
   }
 
-  if (!database.sites.length) database.sites = seedDatabase().sites;
-  if (!database.crews.length) database.crews = seedDatabase().crews;
-  if (!database.crewMembers.length) database.crewMembers = seedDatabase().crewMembers;
-  if (!database.priorities.length) database.priorities = seedDatabase().priorities;
-  if (!database.taskStatuses.length) database.taskStatuses = seedDatabase().taskStatuses;
-  if (!database.tasks.length) database.tasks = seedDatabase().tasks;
-  if (!database.materialCatalog.length) database.materialCatalog = seedDatabase().materialCatalog;
+  const materialDeliveryDocs = [
+    { deliveryDocId: 1, requestId: 5, eventType: 'Issued', eventAt: isoNow(), docNumber: 'M-0005', note: 'Выдано со склада' },
+    { deliveryDocId: 2, requestId: 10, eventType: 'Delivered', eventAt: isoNow(), docNumber: 'M-0010', note: 'Доставлено на объект' },
+    { deliveryDocId: 3, requestId: 16, eventType: 'Issued', eventAt: isoNow(), docNumber: 'M-0016', note: 'Выдача под монтаж' },
+    { deliveryDocId: 4, requestId: 21, eventType: 'Closed', eventAt: isoNow(), docNumber: 'M-0021', note: 'Закрыто по приемке' }
+  ];
+
+  const dailyPlans = [
+    { planId: 1, planDate: date, createdByUserId: 2, createdAt: isoNow(), comment: 'План работ на текущий день по всем бригадам', status: 'Утвержден' }
+  ];
+
+  const dailyPlanItems = [
+    { planItemId: 1, planId: 1, taskId: 1, crewId: 1, sortOrder: 1, note: 'Закрыть исполнительную схему', materialsReady: true },
+    { planItemId: 2, planId: 1, taskId: 2, crewId: 1, sortOrder: 2, note: 'Проверить фиксаторы до 12:00', materialsReady: false },
+    { planItemId: 3, planId: 1, taskId: 18, crewId: 1, sortOrder: 3, note: 'Сверить сертификаты', materialsReady: true },
+    { planItemId: 4, planId: 1, taskId: 6, crewId: 2, sortOrder: 1, note: 'Начать с осей 2-4', materialsReady: true },
+    { planItemId: 5, planId: 1, taskId: 9, crewId: 2, sortOrder: 2, note: 'Контроль влажности основания', materialsReady: true },
+    { planItemId: 6, planId: 1, taskId: 11, crewId: 3, sortOrder: 1, note: 'Не закрывать лотки до прозвонки', materialsReady: true },
+    { planItemId: 7, planId: 1, taskId: 13, crewId: 3, sortOrder: 2, note: 'Проверить подвесы', materialsReady: true },
+    { planItemId: 8, planId: 1, taskId: 15, crewId: 3, sortOrder: 3, note: 'Согласовать тест с охраной', materialsReady: false }
+  ];
+
+  return {
+    sites,
+    crews,
+    crewMembers,
+    priorities,
+    taskStatuses,
+    tasks,
+    taskReports,
+    materialCatalog,
+    materialRequests,
+    materialRequestItems,
+    materialDeliveryDocs,
+    dailyPlans,
+    dailyPlanItems
+  };
+}
+
+function taskSeed(date, taskId, siteId, crewId, title, description, startOffset, endOffset, priorityId, taskStatusId) {
+  return {
+    taskId,
+    siteId,
+    crewId,
+    title,
+    description,
+    startDate: addDays(date, startOffset),
+    endDate: addDays(date, endOffset),
+    priorityId,
+    taskStatusId,
+    labelId: null,
+    externalId: `seed:task:${String(taskId).padStart(2, '0')}`,
+    publicCode: `T-${String(taskId).padStart(5, '0')}`,
+    lastPrintedAt: null
+  };
+}
+
+function ensureStarterRows(database, seeded) {
+  for (const role of seeded.roles) {
+    if (!database.roles.some(item => item.roleId === role.roleId)) database.roles.push(role);
+  }
+
+  for (const starter of [
+    ...seeded.users,
+    userSeed(4, 'maksim', 'maksim', 'Maksim', 1)
+  ]) {
+    const existing = database.users.find(item => item.username === starter.username);
+    if (!existing) {
+      const userToAdd = { ...starter };
+      if (database.users.some(item => Number(item.userId) === Number(userToAdd.userId))) {
+        userToAdd.userId = Math.max(0, ...database.users.map(item => Number(item.userId || 0))) + 1;
+      }
+      database.users.push(userToAdd);
+    } else {
+      existing.isActive = true;
+      existing.roleId = starter.roleId;
+      existing.fullName = existing.fullName || starter.fullName;
+      if (starter.username === 'maksim' || !existing.passwordHash) setUserPassword(existing, starter.username);
+    }
+  }
+
+  const siteIdMap = ensureSeedRows(database, 'sites', seeded.sites, 'siteId', site => site.siteCode || site.siteName);
+  const crewIdMap = ensureSeedRows(database, 'crews', seeded.crews, 'crewId', crew => crew.externalId || crew.crewName);
+  ensureSeedRows(
+    database,
+    'crewMembers',
+    seeded.crewMembers.map(member => ({
+      ...member,
+      crewId: mappedId(crewIdMap, member.crewId)
+    })),
+    null,
+    member => `${member.crewId}:${member.userId}`);
+  ensureSeedRows(database, 'priorities', seeded.priorities, 'priorityId', priority => priority.priorityName);
+  ensureSeedRows(database, 'taskStatuses', seeded.taskStatuses, 'taskStatusId', status => status.taskStatusName);
+
+  const taskIdMap = ensureSeedRows(
+    database,
+    'tasks',
+    seeded.tasks.map(task => ({
+      ...task,
+      siteId: mappedId(siteIdMap, task.siteId),
+      crewId: mappedId(crewIdMap, task.crewId)
+    })),
+    'taskId',
+    task => task.externalId || task.publicCode || task.title);
+  ensureSeedRows(
+    database,
+    'taskReports',
+    seeded.taskReports.map(report => ({
+      ...report,
+      taskId: mappedId(taskIdMap, report.taskId)
+    })),
+    'reportId',
+    report => `seed-report:${report.taskId}:${report.progressPercent}:${report.reportText}`);
+  ensureSeedRows(database, 'materialCatalog', seeded.materialCatalog, 'materialId', material => material.code || `${material.name}:${material.unit}`);
+
+  const materialRequestIdMap = ensureSeedMaterialRequests(
+    database,
+    seeded.materialRequests.map(request => ({
+      ...request,
+      taskId: mappedId(taskIdMap, request.taskId)
+    })),
+    seeded.materialRequestItems);
+  ensureSeedRows(
+    database,
+    'materialDeliveryDocs',
+    seeded.materialDeliveryDocs.map(doc => ({
+      ...doc,
+      requestId: mappedId(materialRequestIdMap, doc.requestId)
+    })),
+    'deliveryDocId',
+    doc => `seed-doc:${doc.requestId}:${doc.eventType}:${doc.docNumber || ''}`);
+
+  const planIdMap = ensureSeedRows(database, 'dailyPlans', seeded.dailyPlans, 'planId', plan => plan.planDate);
+  ensureSeedRows(
+    database,
+    'dailyPlanItems',
+    seeded.dailyPlanItems.map(item => ({
+      ...item,
+      planId: mappedId(planIdMap, item.planId),
+      taskId: mappedId(taskIdMap, item.taskId),
+      crewId: mappedId(crewIdMap, item.crewId)
+    })),
+    'planItemId',
+    item => `seed-plan:${item.planId}:${item.taskId}:${item.crewId}`);
+}
+
+function ensureSeedRows(database, collectionName, seededRows, idField, keySelector) {
+  const idMap = new Map();
+  if (!Array.isArray(database[collectionName])) {
+    database[collectionName] = [];
+  }
+
+  for (const seedRow of seededRows || []) {
+    const seedKey = keySelector(seedRow);
+    const existing = database[collectionName].find(row => same(keySelector(row), seedKey));
+    if (existing) {
+      if (seedRow.externalId && !existing.externalId) existing.externalId = seedRow.externalId;
+      if (seedRow.isActive !== undefined) existing.isActive = seedRow.isActive;
+      if (idField) idMap.set(Number(seedRow[idField]), Number(existing[idField]));
+      continue;
+    }
+
+    const row = { ...seedRow };
+    if (idField && database[collectionName].some(item => Number(item[idField]) === Number(row[idField]))) {
+      row[idField] = nextSeedId(database[collectionName], idField);
+    }
+    database[collectionName].push(row);
+    if (idField) idMap.set(Number(seedRow[idField]), Number(row[idField]));
+  }
+
+  return idMap;
+}
+
+function ensureSeedMaterialRequests(database, seededRequests, seededItems) {
+  const requestIdMap = new Map();
+  if (!Array.isArray(database.materialRequests)) database.materialRequests = [];
+  if (!Array.isArray(database.materialRequestItems)) database.materialRequestItems = [];
+
+  const itemsByRequestId = new Map();
+  for (const item of seededItems || []) {
+    addIndexed(itemsByRequestId, Number(item.requestId), item);
+  }
+
+  for (const seedRequest of seededRequests || []) {
+    const marker = materialRequestSeedMarker(seedRequest.comment);
+    const exists = marker && database.materialRequests.some(request =>
+      String(request.comment || '').includes(marker));
+    if (exists) {
+      const existing = database.materialRequests.find(request =>
+        String(request.comment || '').includes(marker));
+      if (existing) requestIdMap.set(Number(seedRequest.requestId), Number(existing.requestId));
+      continue;
+    }
+
+    const request = { ...seedRequest };
+    const originalRequestId = request.requestId;
+    if (database.materialRequests.some(item => Number(item.requestId) === Number(request.requestId))) {
+      request.requestId = nextSeedId(database.materialRequests, 'requestId');
+    }
+
+    database.materialRequests.push(request);
+    requestIdMap.set(Number(originalRequestId), Number(request.requestId));
+    for (const seedItem of itemsByRequestId.get(Number(originalRequestId)) || []) {
+      const item = { ...seedItem, requestId: request.requestId };
+      if (database.materialRequestItems.some(existing => Number(existing.requestItemId) === Number(item.requestItemId))) {
+        item.requestItemId = nextSeedId(database.materialRequestItems, 'requestItemId');
+      }
+      database.materialRequestItems.push(item);
+    }
+  }
+
+  return requestIdMap;
+}
+
+function mappedId(idMap, id) {
+  return idMap && idMap.has(Number(id)) ? idMap.get(Number(id)) : id;
+}
+
+function materialRequestSeedMarker(comment) {
+  const match = /Демо MR-\d+/i.exec(String(comment || ''));
+  return match ? match[0] : null;
+}
+
+function nextSeedId(rows, idField) {
+  return Math.max(0, ...rows.map(item => Number(item[idField] || 0))) + 1;
 }
 
 function rebuildCounters(database) {
@@ -1264,8 +1922,17 @@ function setUserPassword(user, password) {
 
 function verifyPassword(password, user) {
   if (!user.passwordHash || !user.passwordSalt) return false;
-  const candidate = crypto.pbkdf2Sync(String(password), user.passwordSalt, Number(user.passwordIterations || PASSWORD_ITERATIONS), 32, 'sha256').toString('base64url');
-  return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(user.passwordHash));
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(String(password), user.passwordSalt, Number(user.passwordIterations || PASSWORD_ITERATIONS), 32, 'sha256', (error, key) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      const expected = Buffer.from(user.passwordHash, 'base64url');
+      resolve(expected.length === key.length && crypto.timingSafeEqual(key, expected));
+    });
+  });
 }
 
 function readBody(req) {
@@ -1273,7 +1940,7 @@ function readBody(req) {
     let raw = '';
     req.on('data', chunk => {
       raw += chunk;
-      if (raw.length > 2_000_000) {
+      if (raw.length > MAX_REQUEST_BODY_BYTES) {
         req.destroy();
         reject(new Error('Request body is too large'));
       }
@@ -1305,27 +1972,30 @@ function routeParts(pathname) {
 }
 
 function joinRole(roleId) {
-  return db.roles.find(role => role.roleId === Number(roleId));
+  return indexes.rolesById.get(Number(roleId)) || null;
 }
 
 function joinUser(userId) {
-  return db.users.find(user => user.userId === Number(userId) && user.isActive !== false) || null;
+  const user = indexes.usersById.get(Number(userId));
+  return user && user.isActive !== false ? user : null;
 }
 
 function joinSite(siteId) {
-  return db.sites.find(site => site.siteId === Number(siteId)) || null;
+  const site = indexes.sitesById.get(Number(siteId));
+  return site && site.isActive !== false ? site : null;
 }
 
 function joinCrew(crewId) {
-  return db.crews.find(crew => crew.crewId === Number(crewId)) || null;
+  const crew = indexes.crewsById.get(Number(crewId));
+  return crew && crew.isActive !== false ? crew : null;
 }
 
 function joinPriority(priorityId) {
-  return db.priorities.find(priority => priority.priorityId === Number(priorityId)) || null;
+  return indexes.prioritiesById.get(Number(priorityId)) || null;
 }
 
 function joinStatus(statusId) {
-  return db.taskStatuses.find(status => status.taskStatusId === Number(statusId)) || null;
+  return indexes.statusesById.get(Number(statusId)) || null;
 }
 
 function isOverdue(task) {
