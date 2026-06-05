@@ -10,15 +10,22 @@ Startup file: app.js
 Branch: main
 ```
 
+`http-wrapper.js` is included only as a compatibility entry point. If BotHost
+tries to run `/app/http-wrapper.js` from an old or internal startup command, it
+starts the same server as `app.js`.
+
 If the runtime log shows `SyntaxError: invalid syntax` on `const http = require('http')`,
 the project is running as Python. Switch the BotHost library/language to Node.js
 and redeploy the same `main` branch.
 
-Required BotHost environment variables:
+BotHost environment variables:
 
 ```text
-PORT=7777
+PORT=<set only if BotHost provides/requires a custom port>
 ```
+
+By default the app follows the BotHost manual and listens on `3000` when
+`PORT` is not set.
 
 No SQL Server variables are required.
 
