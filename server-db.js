@@ -826,7 +826,7 @@ function handleDailyPlan(res, method, route, body, query) {
 
   if (method === 'GET' && route[1] === 'approved-items') {
     const date = normalizeDate(query.get('date') || today());
-    const planIds = db.dailyPlans.filter(item => item.planDate === date && item.status === 'Утвержден').map(item => item.planId);
+    const planIds = db.dailyPlans.filter(item => item.planDate === date && isApprovedPlanStatus(item.status)).map(item => item.planId);
     return json(res, 200, db.dailyPlanItems.filter(item => planIds.includes(item.planId)).map(dailyPlanItemDto));
   }
 
@@ -866,19 +866,73 @@ function brigadierTasks(user, date) {
     return [];
   }
 
-  const source = db.tasks.filter(t => crewIds.has(t.crewId));
-  return source.filter(task => task.startDate <= normalized && task.endDate >= normalized);
+  const seenTaskIds = new Set();
+  const result = [];
+
+  for (const item of approvedPlanItemsForCrews(normalized, crewIds)) {
+    const task = indexes.tasksById.get(Number(item.taskId));
+    if (!task || seenTaskIds.has(Number(task.taskId))) continue;
+    seenTaskIds.add(Number(task.taskId));
+    result.push(taskForCrew(task, item.crewId));
+  }
+
+  for (const task of db.tasks) {
+    if (seenTaskIds.has(Number(task.taskId))) continue;
+    if (!crewIds.has(Number(task.crewId))) continue;
+    if (task.startDate > normalized || task.endDate < normalized) continue;
+    seenTaskIds.add(Number(task.taskId));
+    result.push(task);
+  }
+
+  return result;
 }
 
 function brigadierTaskById(user, taskId) {
   const crewIds = new Set(brigadierCrewIds(user));
   const task = indexes.tasksById.get(Number(taskId));
-  return task && crewIds.has(task.crewId) ? task : null;
+  return task && (crewIds.has(Number(task.crewId)) || isTaskInApprovedPlanForCrews(task.taskId, crewIds)) ? task : null;
 }
 
 function brigadierTaskByPublicCode(user, publicCode) {
   const crewIds = new Set(brigadierCrewIds(user));
-  return db.tasks.find(task => same(task.publicCode, publicCode) && crewIds.has(task.crewId));
+  return db.tasks.find(task =>
+    same(task.publicCode, publicCode) &&
+    (crewIds.has(Number(task.crewId)) || isTaskInApprovedPlanForCrews(task.taskId, crewIds)));
+}
+
+function approvedPlanItemsForCrews(date, crewIds) {
+  const normalized = normalizeDate(date);
+  const approvedPlanIds = new Set(
+    db.dailyPlans
+      .filter(plan => plan.planDate === normalized && isApprovedPlanStatus(plan.status))
+      .map(plan => Number(plan.planId)));
+
+  if (approvedPlanIds.size === 0) return [];
+
+  return db.dailyPlanItems
+    .filter(item => approvedPlanIds.has(Number(item.planId)) && crewIds.has(Number(item.crewId)))
+    .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0));
+}
+
+function isTaskInApprovedPlanForCrews(taskId, crewIds) {
+  const normalizedTaskId = Number(taskId);
+  return db.dailyPlanItems.some(item =>
+    Number(item.taskId) === normalizedTaskId &&
+    crewIds.has(Number(item.crewId)) &&
+    isApprovedPlanId(item.planId));
+}
+
+function isApprovedPlanId(planId) {
+  const plan = db.dailyPlans.find(item => Number(item.planId) === Number(planId));
+  return Boolean(plan && isApprovedPlanStatus(plan.status));
+}
+
+function isApprovedPlanStatus(status) {
+  return ['утвержден', 'утверждён'].includes(String(status || '').trim().toLowerCase());
+}
+
+function taskForCrew(task, crewId) {
+  return Number(task.crewId) === Number(crewId) ? task : { ...task, crewId: Number(crewId) };
 }
 
 function brigadierCrewIds(user) {
@@ -930,18 +984,11 @@ function calendarDays(user, year, month) {
   const m = month || (new Date().getMonth() + 1);
   const start = new Date(Date.UTC(y, m - 1, 1));
   const end = new Date(Date.UTC(y, m, 0));
-  const startDate = start.toISOString().slice(0, 10);
-  const endDate = end.toISOString().slice(0, 10);
-  const crewIds = new Set(brigadierCrewIds(user));
-  const tasks = db.tasks.filter(task =>
-    crewIds.has(task.crewId) &&
-    task.startDate <= endDate &&
-    task.endDate >= startDate);
   const result = [];
 
   for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
     const date = d.toISOString().slice(0, 10);
-    const dayTasks = tasks.filter(task => task.startDate <= date && task.endDate >= date);
+    const dayTasks = brigadierTasks(user, date);
     if (dayTasks.length > 0) {
       result.push({ date, taskCount: dayTasks.length, hasOverdue: dayTasks.some(isOverdue) });
     }
